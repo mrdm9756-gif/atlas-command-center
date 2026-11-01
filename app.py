@@ -8,6 +8,7 @@ import streamlit as st
 st.set_page_config(page_title="ATLAS Command Center", page_icon="🧠", layout="wide",
                    initial_sidebar_state="expanded")
 
+import auth  # noqa: E402
 import config  # noqa: E402
 import database as dbm  # noqa: E402
 import scheduler_service as ss  # noqa: E402
@@ -41,6 +42,40 @@ def _boot() -> dict:
     return {"scheduler_started": started, "recovered": recovered}
 
 
+def _login_screen(state: str) -> None:
+    """Shown instead of the app until the owner signs in. Fails closed when no password is set."""
+    name = ui.esc(dbm.get_setting("ai_name"))
+    st.markdown(f"## 🔒 {name} Command Center")
+    if state in (auth.NOT_CONFIGURED, auth.WEAK):
+        if state == auth.WEAK:
+            st.error(f"The ATLAS_PASSWORD you set is too short (minimum {auth.MIN_PASSWORD_LENGTH} characters).")
+        else:
+            st.warning("The app is locked because no owner password has been set yet.")
+        st.markdown(
+            "**Set your password (one time):**\n"
+            "1. Streamlit Cloud: open your app -> **Manage app -> Settings -> Secrets**.\n"
+            f"2. Add this line, using your own password of at least {auth.MIN_PASSWORD_LENGTH} characters:\n"
+            "   `ATLAS_PASSWORD = \"your-secret-password\"`\n"
+            "3. Save, then reload this page.\n\n"
+            "Running on your own computer? Put `ATLAS_PASSWORD=...` in the `.env` file instead "
+            "(or `ATLAS_DISABLE_LOGIN=1` to turn login off for local use only).")
+        return
+    left = auth.lock_seconds_left()
+    if left:
+        st.error(f"Too many wrong attempts. Try again in {left // 60 + 1} minute(s).")
+        return
+    with st.form("login_form"):
+        pw = st.text_input("Owner password", type="password", max_chars=200)
+        go = st.form_submit_button("Log in", type="primary")
+    if go:
+        ok, msg = auth.check_password(pw)
+        if ok:
+            auth.sign_in(st.session_state)
+            st.rerun()
+        else:
+            st.error(msg)
+
+
 def main() -> None:
     try:
         boot = _boot()
@@ -51,6 +86,10 @@ def main() -> None:
         return
 
     ui.inject_css()
+
+    if not auth.is_authenticated(st.session_state):
+        _login_screen(auth.status())
+        return
 
     # Page requested by a button elsewhere (must be applied BEFORE the radio is created)
     if "goto" in st.session_state:
@@ -83,8 +122,18 @@ def main() -> None:
         pend = len(dbm.list_approvals(ctx.company_id, status="pending"))
         if pend and dbm.get_bool("notify_dashboard"):
             ui.md_html(ui.badge(f"{pend} APPROVAL(S) WAITING", "warn"))
+        if auth.login_required():
+            st.divider()
+            st.caption("Signed in as owner")
+            if st.button("🚪 Log out", key="logout_btn"):
+                auth.sign_out(st.session_state)
+                st.rerun()
+        else:
+            ui.md_html(ui.badge("LOGIN OFF (local only)", "warn"))
 
-    page = st.session_state["nav"]
+    page = st.session_state.get("nav", "Voice Interface")
+    if page not in PAGE_MODULES:
+        page = "Voice Interface"
     try:
         module = importlib.import_module(PAGE_MODULES[page])
         module.render(ctx)
